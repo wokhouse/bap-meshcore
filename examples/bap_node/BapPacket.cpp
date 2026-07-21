@@ -10,6 +10,58 @@ size_t BapPacket::encode(uint8_t* buf, uint16_t stop_code,
                          const ArrivalVisit* visits, uint8_t n_visits) {
   if (n_visits > BAP_MAX_VISITS) n_visits = BAP_MAX_VISITS;
 
+  // BAP_DATA_BUDGET is the space for header+visits BEFORE the signature; the
+  // signature is already subtracted out in the budget derivation (see
+  // BapPacket.h). So everything below must fit header+visits into exactly
+  // BAP_DATA_BUDGET.
+  //
+  // Two-pass design. The old single-pass loop truncated each destination
+  // against only the bytes remaining at that moment, ignoring the current
+  // visit's ETA byte and all later visits. With 3 full-length destinations
+  // (5 + 3*37 = 116 > 104) it wrote visits 1-2 up to the budget edge, then
+  // bailed on the final ETA — dropping the ENTIRE packet instead of trimming
+  // destinations. Result: the gateway broadcast nothing for a perfectly normal
+  // 3-arrival response.
+
+  // --- Pass 1: measure fixed overhead and each destination's natural length.
+  size_t lineref_len[BAP_MAX_VISITS];
+  size_t dest_natural[BAP_MAX_VISITS];
+  size_t dest_len[BAP_MAX_VISITS];
+
+  size_t overhead = BAP_HEADER_LEN;   // TYPE+VER+stopcode(2)+visit_count
+  for (uint8_t v = 0; v < n_visits; v++) {
+    lineref_len[v]  = strnlen(visits[v].line_ref, BAP_LINE_REF_MAX - 1);
+    dest_natural[v] = strnlen(visits[v].dest, BAP_DEST_MAX - 1);
+    // Fixed per-visit cost: lineref bytes + null + dest bytes + null + eta.
+    overhead += lineref_len[v] + 3;
+  }
+  // Defensive: if even the empty-dest structure can't fit, give up. With
+  // BAP_MAX_VISITS=3 this never trips (~23 bytes), but guards a future bump.
+  if (overhead > BAP_DATA_BUDGET) return 0;
+  size_t dest_budget = BAP_DATA_BUDGET - overhead;
+
+  // --- Pass 2: distribute dest_budget across visits with max-min fairness.
+  // Short destinations keep their full text; only destinations that are
+  // collectively too long get trimmed. This guarantees 3 visits always encode
+  // (e.g. "Ferry Building" + "Embarcadero Station" + "SF State University")
+  // rather than failing the whole broadcast. O(budget*n) with budget<=~90 and
+  // n<=3 — trivial on an ESP32-S3, and obviously correct by construction.
+  for (uint8_t v = 0; v < n_visits; v++) dest_len[v] = 0;
+  while (dest_budget > 0) {
+    uint8_t best = 0xFF;
+    size_t best_alloc = SIZE_MAX;
+    for (uint8_t v = 0; v < n_visits; v++) {
+      if (dest_len[v] < dest_natural[v] && dest_len[v] < best_alloc) {
+        best_alloc = dest_len[v];
+        best = v;
+      }
+    }
+    if (best == 0xFF) break;   // every destination is already at full length
+    dest_len[best]++;
+    dest_budget--;
+  }
+
+  // --- Emit.
   size_t i = 0;
   buf[i++] = BAP_TYPE_BYTE;
   buf[i++] = BAP_VERSION;
@@ -18,28 +70,18 @@ size_t BapPacket::encode(uint8_t* buf, uint16_t stop_code,
   buf[i++] = n_visits;
 
   for (uint8_t v = 0; v < n_visits; v++) {
-    // LineRef (null-terminated)
-    size_t lr_len = strnlen(visits[v].line_ref, BAP_LINE_REF_MAX - 1);
-    if (i + lr_len + 1 > BAP_DATA_BUDGET) return 0;
-    memcpy(&buf[i], visits[v].line_ref, lr_len);
-    i += lr_len;
+    memcpy(&buf[i], visits[v].line_ref, lineref_len[v]);
+    i += lineref_len[v];
     buf[i++] = '\0';
 
-    // DestDisplay (null-terminated, truncated if needed)
-    size_t dest_len = strnlen(visits[v].dest, BAP_DEST_MAX - 1);
-    // Truncate dest if it would overflow the data budget (leave room for \0 + eta + sig)
-    size_t remaining = BAP_DATA_BUDGET - i - 1;  // -1 for null
-    if (dest_len > remaining) dest_len = remaining;
-    memcpy(&buf[i], visits[v].dest, dest_len);
-    i += dest_len;
+    memcpy(&buf[i], visits[v].dest, dest_len[v]);
+    i += dest_len[v];
     buf[i++] = '\0';
 
-    // ETA byte
-    if (i + 1 > BAP_DATA_BUDGET) return 0;
     buf[i++] = visits[v].eta_min;
   }
 
-  return i;  // data_len (no signature)
+  return i;  // data_len (no signature); guaranteed <= BAP_DATA_BUDGET
 }
 
 size_t BapPacket::sign(uint8_t* buf, size_t data_len, const uint8_t privkey[64]) {
