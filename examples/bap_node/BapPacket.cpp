@@ -59,47 +59,80 @@ bool BapPacket::verify(const uint8_t* buf, size_t data_len, const uint8_t pubkey
   return Ed25519::verify(&buf[data_len], pubkey, buf, data_len);
 }
 
+// Walk the header+visits structure to compute the exact number of signed bytes.
+// This is needed because the decrypted buffer is padded up to a 16-byte AES
+// block boundary by meshcore's cipher (Utils::encrypt rounds up, Utils::decrypt
+// returns the full block-rounded length). The signature was made over the
+// *unpadded* plaintext, so we must reconstruct that length from the packet
+// structure rather than trusting the buffer length. Returns 0 on malformed input.
+static size_t signedLen_(const uint8_t* buf, size_t buf_len) {
+  if (buf_len < BAP_HEADER_LEN + BAP_SIG_LEN) return 0;
+  if (buf[0] != BAP_TYPE_BYTE) return 0;
+  if (buf[1] != BAP_VERSION) return 0;
+  uint8_t n_visits = buf[4];
+  if (n_visits > BAP_MAX_VISITS) return 0;
+
+  size_t i = BAP_HEADER_LEN;
+  size_t sig_start = buf_len - BAP_SIG_LEN;   // earliest the sig can begin
+
+  for (uint8_t v = 0; v < n_visits; v++) {
+    // LineRef: scan to null terminator
+    size_t lr_len = 0;
+    while (i + lr_len < sig_start && buf[i + lr_len] != '\0') lr_len++;
+    if (i + lr_len >= sig_start) return 0;     // ran into signature without null
+    i += lr_len + 1;
+
+    // DestDisplay: scan to null terminator
+    size_t dest_len = 0;
+    while (i + dest_len < sig_start && buf[i + dest_len] != '\0') dest_len++;
+    if (i + dest_len >= sig_start) return 0;
+    i += dest_len + 1;
+
+    // ETA
+    if (i >= sig_start) return 0;
+    i++;
+  }
+  return i;   // exact number of bytes that were signed
+}
+
+bool BapPacket::verifySigned(const uint8_t* buf, size_t buf_len, const uint8_t pubkey[32]) {
+  size_t data_len = signedLen_(buf, buf_len);
+  if (data_len == 0) return false;
+  return Ed25519::verify(&buf[data_len], pubkey, buf, data_len);
+}
+
 bool BapPacket::decode(const uint8_t* buf, size_t total_len,
                        uint16_t& stop_code, uint8_t& n_visits,
                        ArrivalVisit* visits, const uint8_t*& sig_ptr) {
-  if (total_len < BAP_HEADER_LEN + BAP_SIG_LEN) return false;
-  if (buf[0] != BAP_TYPE_BYTE) return false;
-  if (buf[1] != BAP_VERSION) return false;
+  // Recover the exact signed length (total_len may include AES block padding).
+  size_t data_len = signedLen_(buf, total_len);
+  if (data_len == 0) return false;
 
   stop_code = ((uint16_t)buf[2] << 8) | buf[3];
   n_visits = buf[4];
-  if (n_visits > BAP_MAX_VISITS) return false;
 
   size_t i = BAP_HEADER_LEN;
-  size_t data_end = total_len - BAP_SIG_LEN;
-
   for (uint8_t v = 0; v < n_visits; v++) {
-    if (i >= data_end) return false;
-
     // LineRef
     size_t lr_len = 0;
-    while (i + lr_len < data_end && buf[i + lr_len] != '\0') lr_len++;
-    if (i + lr_len >= data_end) return false;  // no null terminator
+    while (i + lr_len < data_len && buf[i + lr_len] != '\0') lr_len++;
     if (lr_len >= BAP_LINE_REF_MAX) lr_len = BAP_LINE_REF_MAX - 1;
     memcpy(visits[v].line_ref, &buf[i], lr_len);
     visits[v].line_ref[lr_len] = '\0';
     i += lr_len + 1;
 
     // DestDisplay
-    if (i >= data_end) return false;
     size_t dest_len = 0;
-    while (i + dest_len < data_end && buf[i + dest_len] != '\0') dest_len++;
-    if (i + dest_len >= data_end) return false;
+    while (i + dest_len < data_len && buf[i + dest_len] != '\0') dest_len++;
     if (dest_len >= BAP_DEST_MAX) dest_len = BAP_DEST_MAX - 1;
     memcpy(visits[v].dest, &buf[i], dest_len);
     visits[v].dest[dest_len] = '\0';
     i += dest_len + 1;
 
     // ETA
-    if (i >= data_end) return false;
     visits[v].eta_min = buf[i++];
   }
 
-  sig_ptr = &buf[data_end];
+  sig_ptr = &buf[data_len];
   return true;
 }

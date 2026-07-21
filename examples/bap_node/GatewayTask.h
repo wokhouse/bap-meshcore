@@ -16,6 +16,7 @@ class GatewayTask {
   unsigned long _next_poll_millis = 0;
   bool _wifi_started = false;
   bool _wifi_connected = false;
+  bool _ntp_synced = false;
   unsigned long _last_wifi_check = 0;
 
   // Per-poll scratch buffer

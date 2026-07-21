@@ -96,6 +96,9 @@ void setup() {
 
   // Role-specific setup
   if (g_config.role == BapRole::GATEWAY) {
+    // Replace the generic boot splash with a gateway-specific one. This stays
+    // on screen (we don't render arrivals until the first successful poll).
+    g_display.beginGateway();
     g_gateway = new GatewayTask(g_config, g_mesh, g_display);
     g_gateway->begin();
   } else {

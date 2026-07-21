@@ -43,7 +43,19 @@ bool MyMesh::sendBapBroadcast(const uint8_t* data_with_sig, size_t total_len) {
   fillBapChannel(ch);
   mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_DATA, ch,
                                           data_with_sig, total_len);
-  if (!pkt) return false;
+  if (!pkt) {
+    // createGroupDatagram returns NULL for two reasons: payload too large, or
+    // packet pool exhausted. Distinguish so the log points at the real cause.
+    // (sendFlood itself is void and cannot be the source of this failure.)
+    if (total_len + 1 + CIPHER_BLOCK_SIZE - 1 > MAX_PACKET_PAYLOAD) {
+      Serial.printf("BAP: packet too large (%u bytes, max %u) — reduce dest length or visit count\n",
+                    (unsigned)total_len,
+                    (unsigned)(MAX_PACKET_PAYLOAD - 1 - (CIPHER_BLOCK_SIZE - 1)));
+    } else {
+      Serial.println("BAP: packet pool exhausted (busy radio?)");
+    }
+    return false;
+  }
   sendFlood(pkt);
   return true;
 }
@@ -67,11 +79,19 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type,
   if (len < BAP_HEADER_LEN + BAP_SIG_LEN) return;
   if (data[0] != BAP_TYPE_BYTE) return;
 
-  size_t data_len = len - BAP_SIG_LEN;
-
-  // Verify Ed25519 signature
-  if (!_cfg->has_pubkey) return;
-  if (!BapPacket::verify(data, data_len, _cfg->pubkey)) return;
+  // Verify Ed25519 signature. Use verifySigned() because `len` (the decrypted
+  // buffer length) includes trailing AES block padding that the signature was
+  // NOT made over — verifySigned walks the structure to find the exact signed
+  // length. The old verify(data, len-SIG) checked the wrong byte range and
+  // always failed when the signed length wasn't a multiple of 16.
+  if (!_cfg->has_pubkey) {
+    if (_display) _display->setStatus("NO PUBKEY");
+    return;
+  }
+  if (!BapPacket::verifySigned(data, len, _cfg->pubkey)) {
+    Serial.println("BAP: signature verify failed, drop");
+    return;
+  }
 
   // Decode
   uint16_t stop_code;

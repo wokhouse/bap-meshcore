@@ -11,6 +11,10 @@ void ArrivalDisplay::begin() {
   showSplash("BAP Node\nStarting...");
 }
 
+void ArrivalDisplay::beginGateway() {
+  showSplash("BAP Gateway\nInitializing...");
+}
+
 void ArrivalDisplay::showSplash(const char* msg) {
   _disp->startFrame();
   _disp->setCursor(0, 0);
@@ -50,7 +54,11 @@ void ArrivalDisplay::render_() {
   _disp->startFrame();
   _disp->clear();
 
-  renderHeader_(0);
+  // Only draw the stop header once we actually have a stop to show — otherwise
+  // boot shows a meaningless "Stop 0" before the first poll.
+  if (_has_data) {
+    renderHeader_(0);
+  }
 
   int y = HEADER_H;
   if (_has_data && _n_visits > 0) {
@@ -59,6 +67,8 @@ void ArrivalDisplay::render_() {
       y += ROW_H;
     }
   } else {
+    // No data yet: show status (e.g. "NTP SYNC...", "Listening...") or a
+    // neutral placeholder. Centered-ish in the visit area.
     _disp->setCursor(0, y + 8);
     _disp->setTextSize(1);
     _disp->print(_status[0] ? _status : "No arrivals");

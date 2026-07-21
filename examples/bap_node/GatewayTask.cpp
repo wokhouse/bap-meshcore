@@ -9,6 +9,9 @@
 static const char* NTP_SERVER = "pool.ntp.org";
 static const long  GMT_OFFSET_SEC = 0;
 static const long  DAYLIGHT_OFFSET_SEC = 0;
+// Earliest plausible "NTP has synced" timestamp. 2024-01-01 UTC. time(nullptr)
+// returns 0 until SNTP resolves, so anything below this means "not synced yet".
+static const time_t NTP_SANITY_EPOCH = 1704067200;
 
 void GatewayTask::begin() {
   // Load private key
@@ -44,6 +47,9 @@ void GatewayTask::loop() {
         configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
       } else {
         Serial.println("WiFi: disconnected");
+        // Force re-validation of NTP on reconnect — a long outage may have let
+        // the RTC drift, and we don't want to broadcast bogus ETAs.
+        _ntp_synced = false;
         if (_display) _display->setStatus("WiFi DOWN");
       }
     }
@@ -61,6 +67,23 @@ void GatewayTask::loop() {
   if (_cfg->num_stops == 0) {
     if (_display) _display->setStatus("NO STOPS");
     return;
+  }
+
+  // Gate the first poll on NTP being actually synced. configTime() is async —
+  // it returns immediately and time(nullptr) reads 0 (or garbage) for several
+  // seconds. Polling before sync produced ~245-minute ETA offsets because
+  // (arrive_sec - ~0)/60 is huge and clamps to the 254 cap. The second poll
+  // looked correct only because NTP had synced by then.
+  if (!_ntp_synced) {
+    time_t t = time(nullptr);
+    if (t < NTP_SANITY_EPOCH) {
+      if (_display) _display->setStatus("NTP SYNC...");
+      return;
+    }
+    _ntp_synced = true;
+    Serial.printf("NTP: synced (%lu)\n", (unsigned long)t);
+    // First poll within 2s of sync, then on the normal interval.
+    _next_poll_millis = now + 2000UL;
   }
 
   // Poll
@@ -143,8 +166,9 @@ void GatewayTask::sendOverMesh_(uint16_t stop_code, const ArrivalVisit* visits, 
     return;
   }
   // _mesh->sendBapBroadcast wraps the data in group-datagram encryption + floods.
+  // It logs the specific failure (oversize vs pool-exhausted); we just report the outcome.
   if (!_mesh->sendBapBroadcast(_tx_buf, total)) {
-    Serial.println("BAP: sendFlood failed");
+    Serial.printf("BAP: broadcast stop %u NOT sent\n", stop_code);
   } else {
     Serial.printf("BAP: broadcast stop %u (%u bytes)\n", stop_code, (unsigned)total);
   }

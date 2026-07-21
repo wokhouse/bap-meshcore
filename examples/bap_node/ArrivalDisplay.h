@@ -15,12 +15,13 @@ class ArrivalDisplay {
   uint8_t _n_visits = 0;
   ArrivalVisit _visits[BAP_MAX_VISITS];
   char _status[BAPDisp_STATUS_MAX] = {0};
-  bool _dirty = true;          // redraw needed
+  bool _dirty = false;         // don't render until splash/status/data arrives
 
 public:
   ArrivalDisplay(DisplayDriver& disp) : _disp(&disp) {}
 
   void begin();
+  void beginGateway();   // role-specific splash
 
   // Update arrivals from mesh or HTTP. Triggers a redraw.
   void updateArrivals(uint16_t stop_code, const ArrivalVisit* visits, uint8_t n);
